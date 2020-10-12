@@ -1,0 +1,146 @@
+name: Build & push images for '${{ prefix.$1 }}'
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+      - '*/chart/**'
+
+jobs:
+  validate-docker-secrets:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Validate docker registry secrets are defined
+      id: validate-docker-secrets
+      run: |
+        echo "Validating docker registry secrets are defined on the repository"
+        FAIL=false
+        validate_secret(){
+          FIELD=$1
+          VALUE=$2
+          if [ -z "${VALUE}" ]; then
+            echo "The secret ${FIELD} needs to be set on this repository."
+            FAIL=true
+          else
+            echo "The secret ${FIELD} is set on this repository."
+          fi
+        }
+        validate_secret DOCKER_USERNAME ${DOCKER_USERNAME}
+        validate_secret DOCKER_PASSWORD ${DOCKER_PASSWORD}
+        validate_secret DOCKER_REPOSITORY ${DOCKER_REPOSITORY}
+        validate_secret DOCKER_IMAGE_COMMAND ${DOCKER_IMAGE_COMMAND}
+        validate_secret DOCKER_IMAGE_${{ $1 }} ${DOCKER_IMAGE_${{ $1 }}}
+        validate_secret GITOPS_EMAIL ${GITOPS_EMAIL}
+        validate_secret GITOPS_TOKEN ${GITOPS_TOKEN}
+        validate_secret GITOPS_ORG ${GITOPS_ORG}
+        if [ "${FAIL}" = "true" ]; then
+          exit 1
+        fi
+      env:
+        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        DOCKER_REPOSITORY: ${{ secrets.DOCKER_REPOSITORY }}
+        DOCKER_IMAGE_COMMAND: ${{ secrets.DOCKER_IMAGE_COMMAND }}
+        DOCKER_IMAGE_${{ $1 }}: ${{ secrets.DOCKER_IMAGE_${{ $1 }} }}
+        GITOPS_EMAIL: ${{ secrets.GITOPS_EMAIL }}
+        GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        GITOPS_ORG: ${{ secrets.GITOPS_ORG }}
+
+  build-docker-images:
+    needs:
+      validate-docker-secrets
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - name: Bump version and push tag
+      id: bump-version-action
+      uses: osowski/github-tag-action@master
+      env:
+        DEFAULT_BUMP: patch
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Install Appsody CLI
+      id: install-appsody-cli
+      uses: ${{ docker.BASE }}/appsody-install-action@master
+    - name: Build the ${{ prefix.$1 }}-command docker image
+      id: build-command-image
+      run: |
+        IMAGE_NAME="${DOCKER_R}/${DOCKER_I}"
+        docker login -u ${DOCKER_U} -p ${DOCKER_P}
+        echo "Build and push the docker image"
+        cd ${WORKDIR}
+        appsody build -v --tag ${IMAGE_NAME}:${IMAGE_TAG} --push
+        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+        docker push ${IMAGE_NAME}
+      env:
+        DOCKER_U: ${{ secrets.DOCKER_USERNAME }}
+        DOCKER_P: ${{ secrets.DOCKER_PASSWORD }}
+        DOCKER_R: ${{ secrets.DOCKER_REPOSITORY }}
+        DOCKER_I: ${{ secrets.DOCKER_IMAGE_COMMAND }}
+        WORKDIR: ${{ prefix.$1 }}-command-ms
+        DOCKERFILE: Dockerfile.multistage
+        IMAGE_TAG: ${{ steps.bump-version-action.outputs.new_tag }}
+    - name: Save ${{ verbose.ACTION }}.yaml
+      uses: actions/upload-artifact@v2
+      with:
+        name: ${{ prefix.$1 }}command-app-deploy.yaml
+        path: ${{ prefix.$1 }}-command-ms/app-deploy.yaml
+    - name: Build the ${{ prefix.$1 }}-${{ $1 }} docker image
+      id: build-${{ $1 }}-image
+      run: |
+        IMAGE_NAME="${DOCKER_R}/${DOCKER_I}"
+        docker login -u ${DOCKER_U} -p ${DOCKER_P}
+        echo "Build and push the docker image"
+        cd ${WORKDIR}
+        appsody build -v --tag ${IMAGE_NAME}:${IMAGE_TAG} --push
+        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+        docker push ${IMAGE_NAME}
+      env:
+        DOCKER_U: ${{ secrets.DOCKER_USERNAME }}
+        DOCKER_P: ${{ secrets.DOCKER_PASSWORD }}
+        DOCKER_R: ${{ secrets.DOCKER_REPOSITORY }}
+        DOCKER_I: ${{ secrets.DOCKER_IMAGE_${{ $1 }} }}
+        WORKDIR: ${{ repo.APPLICATION }}
+        DOCKERFILE: Dockerfile.multistage
+        IMAGE_TAG: ${{ steps.bump-version-action.outputs.new_tag }}
+    - name: Save {{ repo.CONTAINER }}.yaml
+      uses: actions/upload-artifact@v2
+      with:
+        name: ${{ application.DEPLOY }}.yaml
+        path: ${{ repo.APPLICATION }}/app-deploy.yaml
+
+  update-gitops:
+    needs:
+      build-docker-images
+    runs-on: ubuntu-latest
+    steps:
+    - name: Configure git client
+      id: configure-git
+      uses: ${{ docker.BASE }}/git-config-action@master
+      with:
+        user-email: ${{ secrets.GITOPS_EMAIL }}
+        gitops-token: ${{ secrets.GITOPS_TOKEN }}
+    - name: Retrieve ${{ verbose.ACTION }}.yaml
+      uses: actions/download-artifact@v2
+      with:
+        name: ${{ prefix.$1 }}command-app-deploy.yaml
+        path: ${{ pipeline.PATH }}
+    - name: Update ${{ verbose.ACTION }}.yaml in GitOps repo
+      id: update-${{ prefix.$1 }}command-gitops
+      uses: ${{ docker.BASE }}/appsody-gitops-update-action@master
+      with:
+        service-name: ${{ pipeline.PATH }}
+        github-org: ${{ secrets.GITOPS_ORG }}
+        gitops-repo-name: ${{ github.REPO }}
+    - name: Retrieve {{ repo.CONTAINER }}.yaml
+      uses: actions/download-artifact@v2
+      with:
+        name: ${{ application.DEPLOY }}.yaml
+        path: ${{ pipeline.SERVICE }}
+    - name: Update {{ repo.CONTAINER }}.yaml in GitOps repo
+      id: update-${{ prefix.$1 }}${{ $1 }}-gitops
+      uses: ${{ docker.BASE }}/appsody-gitops-update-action@master
+      with:
+        service-name: ${{ pipeline.SERVICE }}
+        github-org: ${{ secrets.GITOPS_ORG }}
+        gitops-repo-name: ${{ github.REPO }}
